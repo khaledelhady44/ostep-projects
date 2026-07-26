@@ -1,0 +1,7 @@
+output.txt
+README.md
+test-wish.sh
+tests
+tests-out
+wish
+wish.c
