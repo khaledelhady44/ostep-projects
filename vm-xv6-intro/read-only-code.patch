@@ -1,0 +1,229 @@
+diff --git a/Makefile b/Makefile
+index c1d391e..e270559 100644
+--- a/Makefile
++++ b/Makefile
+@@ -168,6 +168,7 @@ mkfs: mkfs.c fs.h
+ UPROGS=\
+ 	_cat\
+ 	_null\
++	_change_code\
+ 	_echo\
+ 	_forktest\
+ 	_grep\
+diff --git a/change_code.c b/change_code.c
+new file mode 100644
+index 0000000..092be3b
+--- /dev/null
++++ b/change_code.c
+@@ -0,0 +1,31 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++#include "fs.h"
++
++
++// use objdump -d change_code.o
++// you will get the assembly and you will notice that c3 is for return
++// chnagne the first bhyte to return value and observe the result
++// 4096 was returned because it happened to be the last value on the eax register.
++
++int add(int a, int b){
++    return a+b;
++}
++
++
++int main(int argc, char* argv[]){
++    printf(1, "val: %d\n", add(5,6));
++    uint *code = (uint *) add;
++    printf(1, "address: %x\n", (uint) code);
++
++    void* addr = (void*) code;
++
++    mprotect(addr, 2);
++    // munprotect(addr, 1);
++    code[0] = 0xc3;
++    printf(1, "val: %d\n", add(5,6));
++    code[0] = 0x55;
++    printf(1, "val: %d\n", add(5,6));
++    exit();
++}
+\ No newline at end of file
+diff --git a/defs.h b/defs.h
+index 82fb982..3f7d310 100644
+--- a/defs.h
++++ b/defs.h
+@@ -185,6 +185,8 @@ void            switchuvm(struct proc*);
+ void            switchkvm(void);
+ int             copyout(pde_t*, uint, void*, uint);
+ void            clearpteu(pde_t *pgdir, char *uva);
++int             protectpg(pde_t *pgdir, void *addr, int len);
++int             unprotectpg(pde_t *pgdir, void *addr, int len);
+ 
+ // number of elements in fixed-size array
+ #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
+diff --git a/syscall.c b/syscall.c
+index 0478841..b9a94b6 100644
+--- a/syscall.c
++++ b/syscall.c
+@@ -102,6 +102,8 @@ extern int sys_unlink(void);
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++extern int sys_mprotect(void);
++extern int sys_munprotect(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -125,6 +127,8 @@ static int (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_mprotect] sys_mprotect,
++[SYS_munprotect] sys_munprotect
+ };
+ 
+ void
+diff --git a/syscall.h b/syscall.h
+index bc5f356..29ef40f 100644
+--- a/syscall.h
++++ b/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_mprotect 22
++#define SYS_munprotect 23
+\ No newline at end of file
+diff --git a/sysproc.c b/sysproc.c
+index 0686d29..8142aa8 100644
+--- a/sysproc.c
++++ b/sysproc.c
+@@ -7,6 +7,64 @@
+ #include "mmu.h"
+ #include "proc.h"
+ 
++int 
++sys_mprotect(void)
++{
++  void* addr;
++  int len;
++
++  if(argptr(0, (char**) &addr, sizeof(void*)) < 0)
++    return -1;
++  if(argint(1, &len) < 0)
++    return -1;
++
++  // cprintf("addr: %d\n", (uint*) addr);
++  // cprintf("len: %d\n", len);
++  // cprintf("limit: %d\n", (uint) addr + len*PGSIZE);
++  // cprintf("size: %d\n", myproc()->sz);
++  if(len <= 0)
++    return -1;
++   
++  if(PGROUNDDOWN((uint) addr) != (uint) addr){
++    return -1;
++  }
++
++  if((uint) addr + len*PGSIZE > myproc()->sz){
++    return -1;
++  }
++
++  return protectpg(myproc()->pgdir, addr, len);
++}
++
++int 
++sys_munprotect(void)
++{
++  void* addr;
++  int len;
++
++  if(argptr(0, (char**) &addr, sizeof(void*)) < 0)
++    return -1;
++  if(argint(1, &len) < 0)
++    return -1;
++
++  // cprintf("addr: %d\n", (uint*) addr);
++  // cprintf("len: %d\n", len);
++  // cprintf("limit: %d\n", (uint) addr + len*PGSIZE);
++  // cprintf("size: %d\n", myproc()->sz);
++  if(len <= 0)
++    return -1;
++   
++  if(PGROUNDDOWN((uint) addr) != (uint) addr){
++    return -1;
++  }
++
++  if((uint) addr + len*PGSIZE > myproc()->sz){
++    return -1;
++  }
++
++  return unprotectpg(myproc()->pgdir, addr, len);
++}
++
+ int
+ sys_fork(void)
+ {
+diff --git a/user.h b/user.h
+index 4f99c52..a514855 100644
+--- a/user.h
++++ b/user.h
+@@ -23,6 +23,8 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int mprotect(void*, int);
++int munprotect(void*, int);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/usys.S b/usys.S
+index 8bfd8a1..42f7a42 100644
+--- a/usys.S
++++ b/usys.S
+@@ -29,3 +29,5 @@ SYSCALL(getpid)
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(mprotect)
++SYSCALL(munprotect)
+diff --git a/vm.c b/vm.c
+index 440f489..832fa7f 100644
+--- a/vm.c
++++ b/vm.c
+@@ -385,6 +385,36 @@ copyout(pde_t *pgdir, uint va, void *p, uint len)
+   return 0;
+ }
+ 
++int protectpg(pde_t *pgdir, void* addr, int len){
++  pte_t* pte;
++
++  for(int i = 0; i < len; i++, addr += PGSIZE){
++
++    if((pte = walkpgdir(pgdir, addr, 0)) == 0)
++    return -1;
++
++    (*pte) &= ~PTE_W;
++  }
++  lcr3(V2P(myproc()->pgdir));
++  return 0;
++}
++
++int unprotectpg(pde_t *pgdir, void* addr, int len){
++
++  pte_t* pte;
++
++  for(int i = 0; i < len; i++, addr += PGSIZE){
++
++    if((pte = walkpgdir(pgdir, addr, 0)) == 0)
++    return -1;
++
++    (*pte) |= PTE_W;
++  }
++  lcr3(V2P(myproc()->pgdir));
++  return 0;
++
++}
++
+ //PAGEBREAK!
+ // Blank page.
+ //PAGEBREAK!
